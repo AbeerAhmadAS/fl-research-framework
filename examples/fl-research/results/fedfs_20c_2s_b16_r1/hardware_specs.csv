@@ -1,0 +1,15 @@
+key,value
+platform,Linux-6.17.0-1015-aws-x86_64-with-glibc2.39
+python_version,3.12.3
+torch_version,2.5.1+cu121
+cuda_available,True
+cuda_version,12.1
+gpu_count,1
+gpu_name,Tesla T4
+cpu_count,4
+strategy,FedFS
+r_fast,1
+r_slow,1
+delta_fast,90.0
+delta_slow,180.0
+epsilon,0.05

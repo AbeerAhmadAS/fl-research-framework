@@ -36,6 +36,7 @@ from .fedadam import FedAdam as FedAdam
 from .fedavg import FedAvg as FedAvg
 from .fedavg_android import FedAvgAndroid as FedAvgAndroid
 from .fedavgm import FedAvgM as FedAvgM
+from .fedfs import FedFS as FedFS
 from .fedmedian import FedMedian as FedMedian
 from .fedopt import FedOpt as FedOpt
 from .fedprox import FedProx as FedProx
@@ -62,6 +63,7 @@ __all__ = [
     "FedAvg",
     "FedAvgAndroid",
     "FedAvgM",
+    "FedFS",
     "FedMedian",
     "FedOpt",
     "FedProx",

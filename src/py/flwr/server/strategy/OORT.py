@@ -1,14 +1,13 @@
 import random
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
-
-import flwr as fl
+from .fedavg import FedAvg
 import numpy as np
 from flwr.common import FitIns, FitRes, Parameters, Scalar
 from flwr.server.client_proxy import ClientProxy
 
 
-class OORT(fl.server.strategy.FedAvg):
+class OORT(FedAvg):
     """
     Core Oort participant selection strategy.
 

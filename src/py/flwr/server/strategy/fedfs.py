@@ -1,7 +1,5 @@
 #This file represents the core FedFS strategy.
 #FedFS = Federating Fast and Slow.
-#This file should contain the algorithm logic only.
-#It does not write CSV files and does not store experiment-specific logs.
 #
 #FedFS core logic:
 #1) deadline-based local training
@@ -152,7 +150,7 @@ class FedFS(FedAvg):
     ) -> Tuple[Optional[Parameters], dict[str, Scalar]]:
 
         # Update FedFS work contribution history before or after aggregation.
-        # This does not change FedAvg aggregation itself; it only updates wk for future selection.
+        
         for client, fit_res in results:
             cid = client.cid
 
@@ -163,8 +161,7 @@ class FedFS(FedAvg):
             self.client_max_work[cid] += max_possible_work
             self.client_work_ratio[cid] = self._get_wk(cid)
 
-        # FedFS still uses the standard FedAvg aggregation rule.
-        # The difference is in client selection and deadline-based local training.
+        
         aggregated_parameters, aggregated_metrics = super().aggregate_fit(
             server_round,
             results,

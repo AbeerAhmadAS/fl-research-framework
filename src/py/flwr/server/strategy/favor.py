@@ -11,7 +11,6 @@
 # - FAVOR reward
 # - FedAvg model aggregation
 #
-# It intentionally contains no CSV or hardware logging.
 
 from __future__ import annotations
 

@@ -2,6 +2,7 @@ import os
 from typing import Dict, List, Tuple
 
 import flwr as fl
+import numpy as np
 from flwr.common import Scalar
 
 # File linking:
@@ -30,6 +31,48 @@ OORT_CUTOFF = float(os.environ.get("OORT_CUTOFF", 0.95))
 OORT_MAX_SELECTIONS = int(os.environ.get("OORT_MAX_SELECTIONS", 10))
 OORT_SEED = int(os.environ.get("OORT_SEED", 1234))
 
+# Simulated client-profile settings for speed-guided exploration.
+# These profiles are used before a client's first successful participation.
+OORT_PROFILE_MIN_DURATION = float(
+    os.environ.get("OORT_PROFILE_MIN_DURATION", 30.0)
+)
+OORT_PROFILE_MAX_DURATION = float(
+    os.environ.get("OORT_PROFILE_MAX_DURATION", 180.0)
+)
+OORT_PROFILE_INITIAL_REWARD = float(
+    os.environ.get("OORT_PROFILE_INITIAL_REWARD", 1.0)
+)
+
+
+def build_client_profiles() -> Dict[str, Dict[str, float]]:
+    """Generate deterministic simulated profiles for all virtual clients."""
+    if OORT_PROFILE_MIN_DURATION <= 0.0:
+        raise ValueError("OORT_PROFILE_MIN_DURATION must be greater than zero.")
+
+    if OORT_PROFILE_MAX_DURATION < OORT_PROFILE_MIN_DURATION:
+        raise ValueError(
+            "OORT_PROFILE_MAX_DURATION must be greater than or equal to "
+            "OORT_PROFILE_MIN_DURATION."
+        )
+
+    if OORT_PROFILE_INITIAL_REWARD <= 0.0:
+        raise ValueError("OORT_PROFILE_INITIAL_REWARD must be greater than zero.")
+
+    rng = np.random.default_rng(OORT_SEED)
+    estimated_durations = rng.uniform(
+        low=OORT_PROFILE_MIN_DURATION,
+        high=OORT_PROFILE_MAX_DURATION,
+        size=NUM_CLIENTS,
+    )
+
+    return {
+        str(cid): {
+            "estimated_duration": float(estimated_durations[cid]),
+            "initial_reward": OORT_PROFILE_INITIAL_REWARD,
+        }
+        for cid in range(NUM_CLIENTS)
+    }
+
 
 def fit_config(server_round: int):
     return {
@@ -38,24 +81,36 @@ def fit_config(server_round: int):
     }
 
 
-def aggregate_train_loss(results: List[Tuple[int, Dict[str, Scalar]]]) -> Dict[str, Scalar]:
+def aggregate_train_loss(
+    results: List[Tuple[int, Dict[str, Scalar]]],
+) -> Dict[str, Scalar]:
     if not results:
         return {}
 
     total = sum(n for n, _ in results)
-    loss = sum(n * float(m.get("train_loss", 0.0)) for n, m in results) / max(total, 1)
+    loss = sum(
+        n * float(m.get("train_loss", 0.0)) for n, m in results
+    ) / max(total, 1)
 
     return {"train_loss": loss}
 
 
-def aggregate_eval_metrics(results: List[Tuple[int, Dict[str, Scalar]]]) -> Dict[str, Scalar]:
+def aggregate_eval_metrics(
+    results: List[Tuple[int, Dict[str, Scalar]]],
+) -> Dict[str, Scalar]:
     if not results:
         return {}
 
     total = sum(n for n, _ in results)
-    acc = sum(n * float(m.get("accuracy", 0.0)) for n, m in results) / max(total, 1)
-    eval_loss = sum(n * float(m.get("eval_loss", 0.0)) for n, m in results) / max(total, 1)
-    eval_duration = sum(float(m.get("eval_duration", 0.0)) for _, m in results)
+    acc = sum(
+        n * float(m.get("accuracy", 0.0)) for n, m in results
+    ) / max(total, 1)
+    eval_loss = sum(
+        n * float(m.get("eval_loss", 0.0)) for n, m in results
+    ) / max(total, 1)
+    eval_duration = sum(
+        float(m.get("eval_duration", 0.0)) for _, m in results
+    )
 
     return {
         "accuracy": acc,
@@ -65,8 +120,13 @@ def aggregate_eval_metrics(results: List[Tuple[int, Dict[str, Scalar]]]) -> Dict
 
 
 def main():
+    client_profiles = build_client_profiles()
+    profile_durations = [
+        profile["estimated_duration"] for profile in client_profiles.values()
+    ]
+
     print("========== Experiment Config ==========")
-    print(f"STRATEGY         = Oort")
+    print("STRATEGY         = Oort")
     print(f"NUM_CLIENTS      = {NUM_CLIENTS}")
     print(f"SELECTED_CLIENTS = {SELECTED_CLIENTS}")
     print(f"ROUNDS           = {ROUNDS}")
@@ -84,12 +144,20 @@ def main():
     print(f"OORT_CUTOFF                 = {OORT_CUTOFF}")
     print(f"OORT_MAX_SELECTIONS         = {OORT_MAX_SELECTIONS}")
     print(f"OORT_SEED                   = {OORT_SEED}")
+    print("----- Speed-guided Profile Settings ---")
+    print(f"PROFILE_MIN_DURATION        = {OORT_PROFILE_MIN_DURATION}")
+    print(f"PROFILE_MAX_DURATION        = {OORT_PROFILE_MAX_DURATION}")
+    print(f"PROFILE_INITIAL_REWARD      = {OORT_PROFILE_INITIAL_REWARD}")
+    print(f"GENERATED_PROFILE_MIN       = {min(profile_durations):.4f}")
+    print(f"GENERATED_PROFILE_MAX       = {max(profile_durations):.4f}")
+    print(f"GENERATED_PROFILE_MEAN      = {np.mean(profile_durations):.4f}")
     print("=======================================")
 
     strategy = OORTWithClientLogging(
         num_clients=NUM_CLIENTS,
         log_dir=LOG_DIR,
         target_accuracy=TARGET_ACCURACY,
+        client_profiles=client_profiles,
 
         exploration_factor=OORT_EXPLORATION_FACTOR,
         exploration_decay=OORT_EXPLORATION_DECAY,

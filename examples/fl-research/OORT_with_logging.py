@@ -197,16 +197,14 @@ class OORTWithClientLogging(OORT):
 
         total_oort_stat_utility = 0.0
 
-        for _, fit_res in results:
-            train_loss = float(fit_res.metrics.get("train_loss", 0.0))
-            num_examples = int(fit_res.metrics.get("num_examples", 0))
-
-            stat_utility = float(
-                fit_res.metrics.get(
-                    "oort_stat_utility",
-                    num_examples * max(train_loss, 0.0),
+        for client, fit_res in results:
+            if "oort_stat_utility" not in fit_res.metrics:
+                raise ValueError(
+                    f"Client {client.cid} did not return "
+                    "'oort_stat_utility', which is required by Oort."
                 )
-            )
+
+            stat_utility = float(fit_res.metrics["oort_stat_utility"])
             total_oort_stat_utility += stat_utility
 
         oort_utilities = [

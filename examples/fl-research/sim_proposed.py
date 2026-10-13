@@ -5,7 +5,8 @@ import flwr as fl
 from flwr.common import Scalar
 
 from client_proposed import client_fn
-from flwr.server.strategy.proposed import ProposedStrategy
+#from flwr.server.strategy.proposed import ProposedWithLogging
+from proposed_with_logging import ProposedWithLogging
 
 
 # ============================================================
@@ -61,6 +62,10 @@ TARGET_ACCURACY = float(
         "TARGET_ACCURACY",
         "0.70",
     )
+)
+LOG_DIR = os.environ.get(
+    "LOG_DIR",
+    "results/proposed_vgg16_cinic10",
 )
 
 
@@ -124,32 +129,135 @@ def fit_config(server_round: int):
 # Training metrics aggregation
 # ============================================================
 
-def aggregate_train_loss(
+def aggregate_fit_metrics(
     results: List[Tuple[int, Dict[str, Scalar]]]
 ) -> Dict[str, Scalar]:
 
     if not results:
         return {}
 
-    total = sum(
+    total_examples = sum(
         n for n, _ in results
     )
 
+    num_clients = len(results)
+
+    # Weighted training loss
     train_loss = sum(
-        n * float(
-            metrics.get(
-                "train_loss",
-                0.0,
-            )
-        )
+        n * float(metrics.get("train_loss", 0.0))
         for n, metrics in results
-    ) / max(total, 1)
+    ) / max(total_examples, 1)
+
+    # Client-side training time
+    fit_durations = [
+        float(metrics.get("fit_duration", 0.0))
+        for _, metrics in results
+    ]
+
+    avg_fit_duration = (
+        sum(fit_durations)
+        / max(num_clients, 1)
+    )
+
+    total_fit_duration = sum(
+        fit_durations
+    )
+
+    # Throughput
+    avg_samples_per_second = (
+        sum(
+            float(
+                metrics.get(
+                    "samples_per_second",
+                    0.0,
+                )
+            )
+            for _, metrics in results
+        )
+        / max(num_clients, 1)
+    )
+
+    # GPU memory
+    avg_gpu_memory_mb = (
+        sum(
+            float(
+                metrics.get(
+                    "gpu_memory_mb",
+                    0.0,
+                )
+            )
+            for _, metrics in results
+        )
+        / max(num_clients, 1)
+    )
+
+    # Model size
+    model_bytes_values = [
+        int(metrics.get("model_bytes", 0))
+        for _, metrics in results
+    ]
+
+    model_bytes = (
+        model_bytes_values[0]
+        if model_bytes_values
+        else 0
+    )
+
+    # Communication
+    total_upload_bytes = sum(
+        int(metrics.get("upload_bytes", 0))
+        for _, metrics in results
+    )
+
+    total_download_bytes = sum(
+        int(metrics.get("download_bytes", 0))
+        for _, metrics in results
+    )
+
+    total_transmitted_bytes = (
+        total_upload_bytes
+        + total_download_bytes
+    )
+
+    total_transmitted_mb = (
+        total_transmitted_bytes
+        / (1024 ** 2)
+    )
 
     return {
-        "train_loss": train_loss,
+        "train_loss":
+            float(train_loss),
+
+        "avg_fit_duration_sec":
+            float(avg_fit_duration),
+
+        "total_fit_duration_sec":
+            float(total_fit_duration),
+
+        "avg_samples_per_second":
+            float(avg_samples_per_second),
+
+        "avg_gpu_memory_mb":
+            float(avg_gpu_memory_mb),
+
+        "model_bytes":
+            int(model_bytes),
+
+        "upload_bytes":
+            int(total_upload_bytes),
+
+        "download_bytes":
+            int(total_download_bytes),
+
+        "total_transmitted_bytes":
+            int(total_transmitted_bytes),
+
+        "total_transmitted_mb":
+            float(total_transmitted_mb),
+
+        "num_successful_fit_clients":
+            int(num_clients),
     }
-
-
 # ============================================================
 # Evaluation metrics aggregation
 # ============================================================
@@ -164,6 +272,8 @@ def aggregate_eval_metrics(
     total = sum(
         n for n, _ in results
     )
+
+    num_clients = len(results)
 
     accuracy = sum(
         n * float(
@@ -185,28 +295,40 @@ def aggregate_eval_metrics(
         for n, metrics in results
     ) / max(total, 1)
 
-    eval_duration = sum(
-        float(
-            metrics.get(
-                "eval_duration",
-                0.0,
+    avg_eval_duration = (
+        sum(
+            float(
+                metrics.get(
+                    "eval_duration",
+                    0.0,
+                )
             )
+            for _, metrics in results
         )
-        for _, metrics in results
+        / max(num_clients, 1)
     )
 
     return {
-        "accuracy": accuracy,
-        "eval_loss": eval_loss,
-        "eval_duration": eval_duration,
+        "accuracy":
+            float(accuracy),
+
+        "eval_loss":
+            float(eval_loss),
+
+        "avg_eval_duration_sec":
+            float(avg_eval_duration),
+
+        "num_evaluated_clients":
+            int(num_clients),
     }
-
-
 # ============================================================
 # Proposed strategy
 # ============================================================
 
-strategy = ProposedStrategy(
+strategy = ProposedWithLogging(
+    num_clients=NUM_CLIENTS,
+    log_dir=LOG_DIR,
+    target_accuracy=TARGET_ACCURACY,
 
     # Final number of training clients
     selected_clients=SELECTED_CLIENTS,
@@ -252,7 +374,7 @@ strategy = ProposedStrategy(
 
     on_fit_config_fn=fit_config,
 
-    fit_metrics_aggregation_fn=aggregate_train_loss,
+    fit_metrics_aggregation_fn=aggregate_fit_metrics,
 
     evaluate_metrics_aggregation_fn=aggregate_eval_metrics,
 )
@@ -339,6 +461,7 @@ if __name__ == "__main__":
         "Client resources: "
         "4 CPUs, 1 GPU"
     )
+    print(f"LOG_DIR           = {LOG_DIR}")
 
     print(
         "========================================\n"

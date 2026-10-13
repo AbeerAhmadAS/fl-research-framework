@@ -3,6 +3,8 @@ Proposed client selection strategy.
 """
 import math
 import random
+from types import SimpleNamespace
+from .OORT import OORT
 from typing import Dict, List, Tuple,Union
 from flwr.common import (
     FitIns,
@@ -112,15 +114,22 @@ class ProposedStrategy(FedAvg):
         valid_final_selectors = {
             "combined_score",
             "fedavg",
+            "oort",
         }
 
         if final_selector not in valid_final_selectors:
             raise ValueError(
                 "final_selector must be either "
-                "'combined_score' or 'fedavg'"
+                "'combined_score', 'fedavg', or 'oort'"
             )
 
         self.final_selector = final_selector
+        # Created only for Proposed+Oort; state persists across rounds.
+        self.oort_selector = (
+            OORT(num_clients=max(shortlist_size, selected_clients),
+                 seed=selection_seed)
+            if final_selector == "oort" else None
+        )
         if shortlist_size <= 0:
             raise ValueError(
                 "shortlist_size must be greater than 0"
@@ -343,8 +352,8 @@ class ProposedStrategy(FedAvg):
             try:
                 request = GetPropertiesIns(
                     config={
-                        "server_round":
-                            int(server_round),
+                        "server_round": int(server_round),
+                        "enable_proposed_profile": True,
                     }
                 )
                 response = client.get_properties(
@@ -1190,19 +1199,24 @@ class ProposedStrategy(FedAvg):
         """
         Configure clients selected for local training.
         """
+
         # ----------------------------------------------------
         # 1. Collect pre-selection information
         # ----------------------------------------------------
+
         profiles = (
             self._collect_client_properties(
                 server_round,
                 client_manager,
             )
         )
+
         self.client_profiles = profiles
+
         # ----------------------------------------------------
         # 2. Eligibility filtering
         # ----------------------------------------------------
+
         eligible_clients = (
             self._filter_eligible_clients(
                 server_round,
@@ -1210,6 +1224,7 @@ class ProposedStrategy(FedAvg):
                 client_manager,
             )
         )
+
         self.eligible_clients = (
             eligible_clients
         )
@@ -1228,7 +1243,7 @@ class ProposedStrategy(FedAvg):
         )
 
         # ----------------------------------------------------
-        # 3. System capability analysis
+        # 4. System capability analysis
         # ----------------------------------------------------
 
         self.system_capability_scores = (
@@ -1240,8 +1255,9 @@ class ProposedStrategy(FedAvg):
         )
 
         # ----------------------------------------------------
-        # 4. Novelty analysis
+        # 5. Raw novelty analysis
         # ----------------------------------------------------
+
         self.novelty_scores = (
             self._compute_novelty_scores(
                 server_round,
@@ -1249,19 +1265,67 @@ class ProposedStrategy(FedAvg):
                 candidate_clients,
             )
         )
+
         # ----------------------------------------------------
-        # 5. Initialization selection
+        # 6. Final novelty score
         # ----------------------------------------------------
-        selected_clients = (
-            self._initial_selection(
+
+        final_novelty_scores = (
+            self._compute_final_novelty_scores(
                 server_round,
-                eligible_clients,
+                self.novelty_scores,
             )
         )
+
+        # ----------------------------------------------------
+        # 7. Combined selection score
+        # ----------------------------------------------------
+
+        self.combined_scores = (
+            self._compute_combined_scores(
+                server_round,
+                self.system_capability_scores,
+                final_novelty_scores,
+            )
+        )
+
+        # ----------------------------------------------------
+        # 8. Build Top-M Combined Score shortlist
+        # ----------------------------------------------------
+
+        shortlist = (
+            self._select_top_clients_by_combined_score(
+                server_round,
+                candidate_clients,
+                self.combined_scores,
+            )
+        )
+
+        # ----------------------------------------------------
+        # 9. Final client selection
+        # ----------------------------------------------------
+
+        final_clients = (
+            self._select_final_clients(
+                server_round,
+                shortlist,
+                self.combined_scores,
+            )
+        )
+
+        selected_clients = list(
+            final_clients.values()
+        )
+
+        # ----------------------------------------------------
+        # 10. Store selected client IDs
+        # ----------------------------------------------------
+
         self.selected_proxy_cids = [
             client.cid
             for client in selected_clients
         ]
+
         selected_logical_cids = [
             self.proxy_to_logical_cid.get(
                 client.cid,
@@ -1269,38 +1333,56 @@ class ProposedStrategy(FedAvg):
             )
             for client in selected_clients
         ]
+
         print(
             f"[ROUND {server_round}] "
             f"Selected logical clients: "
             f"{selected_logical_cids}"
         )
+
+        # ----------------------------------------------------
+        # 11. Stop if no clients were selected
+        # ----------------------------------------------------
+
         if not selected_clients:
             print(
                 f"[ROUND {server_round}] "
                 f"No clients selected."
             )
             return []
+
         # ----------------------------------------------------
-        # 5. Record selected clients in system history
+        # 12. Record selected clients in system history
         # ----------------------------------------------------
+
         self._record_selected_clients(
             selected_clients
         )
+
         # ----------------------------------------------------
-        # 6. Build Flower FitIns
+        # 13. Build Flower FitIns
         # ----------------------------------------------------
+
         config = {}
+
         if self.on_fit_config_fn is not None:
             config = self.on_fit_config_fn(
                 server_round
             )
+
+        if self.final_selector == "oort":
+            config["enable_oort_utility"] = True
+
         fit_ins = FitIns(
             parameters,
             config,
         )
+
         # ----------------------------------------------------
-        # 7. Only selected clients receive fit instructions
+        # 14. Only final selected clients receive
+        #     training instructions
         # ----------------------------------------------------
+
         return [
             (
                 client,
@@ -2364,6 +2446,43 @@ class ProposedStrategy(FedAvg):
             )
 
         # ----------------------------------------------------
+        # 3. Oort selection from the Proposed shortlist
+        # ----------------------------------------------------
+
+        elif self.final_selector == "oort":
+            # Oort reads client.cid; pass lightweight logical-ID views,
+            # never those views to Flower for actual training.
+            logical_to_proxy = {}
+            logical_views = []
+            for proxy_cid, client in shortlist.items():
+                logical_cid = str(self.proxy_to_logical_cid[proxy_cid])
+                if logical_cid in logical_to_proxy:
+                    raise ValueError(
+                        f"Duplicate logical CID in shortlist: {logical_cid}"
+                    )
+                logical_to_proxy[logical_cid] = proxy_cid
+                logical_views.append(SimpleNamespace(cid=logical_cid))
+            self.oort_selector.num_clients = max(
+                self.oort_selector.num_clients,
+                len(set(str(p.get("cid")) for p in self.client_profiles.values())),
+            )
+            chosen, num_exploit, num_explore = (
+                self.oort_selector._oort_select_clients(
+                    server_round=server_round,
+                    available_clients=logical_views,
+                    sample_size=final_count,
+                )
+            )
+            selected_proxy_cids = [
+                logical_to_proxy[client.cid] for client in chosen
+            ]
+            self.oort_selector.current_num_exploit = num_exploit
+            self.oort_selector.current_num_explore = num_explore
+            self.oort_selector.current_selected_clients = [
+                client.cid for client in chosen
+            ]
+
+        # ----------------------------------------------------
         # Safety check
         # ----------------------------------------------------
 
@@ -2508,6 +2627,19 @@ class ProposedStrategy(FedAvg):
                 failures,
             )
         )
+        # Update Oort history using logical IDs, without a second FedAvg.
+        if self.final_selector == "oort":
+            logical_results = [
+                (
+                    SimpleNamespace(cid=str(self.proxy_to_logical_cid[client.cid])),
+                    fit_res,
+                )
+                for client, fit_res in results
+            ]
+            self.oort_selector.update_history_from_results(
+                server_round, logical_results,
+            )
+
         # ----------------------------------------------------
         # 4. Update Reference Bank
         # ----------------------------------------------------

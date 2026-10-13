@@ -2,6 +2,7 @@ import os
 import time
 import random
 import psutil
+import json
 from dataclasses import dataclass
 from typing import Dict, List, Union
 
@@ -109,6 +110,12 @@ class DataConfig:
     # Batch size used only when computing the local data profile.
     profile_batch_size: int = int(
         os.environ.get("PROFILE_BATCH_SIZE", 64)
+    )
+    data_profile_cache_dir: str = os.environ.get(
+        "DATA_PROFILE_CACHE_DIR",
+        os.path.expanduser(
+            "~/.cache/fl-research/data_profiles"
+        ),
     )
     partition_mode: str = os.environ.get("PARTITION_MODE", "iid").lower()
     dirichlet_alpha: float = float(os.environ.get("DIRICHLET_ALPHA", "0.5"))
@@ -443,21 +450,21 @@ class ProposedClient(fl.client.NumPyClient):
         )
 
         # ----------------------------------------------------
-        # Build local VGG16 model
+        # Lazy model initialization
+        #
+        # The VGG16 model is intentionally NOT created here.
+        # Pre-selection profiling through get_properties()
+        # does not require the training model.
+        #
+        # The model is created only when a Flower operation
+        # actually requires model parameters, training, or
+        # evaluation.
         # ----------------------------------------------------
 
-        self.model = build_vgg16(
-            num_classes=10
-        ).to(DEVICE)
-
-        self.criterion = nn.CrossEntropyLoss()
-
-        self.opt = optim.SGD(
-            self.model.parameters(),
-            lr=cfg.lr,
-            momentum=0.9,
-            weight_decay=5e-4,
-        )
+        self.model = None
+        self.criterion = None
+        self.opt = None
+        self.model_bytes = None
 
         # ----------------------------------------------------
         # Load datasets
@@ -562,9 +569,7 @@ class ProposedClient(fl.client.NumPyClient):
             pin_memory=torch.cuda.is_available(),
         )
 
-        self.model_bytes = model_size_bytes(
-            self.model
-        )
+        
 
         # ----------------------------------------------------
         # Compute the profile once.
@@ -574,9 +579,229 @@ class ProposedClient(fl.client.NumPyClient):
         # every training round.
         # ----------------------------------------------------
 
-        self.data_profile = self.compute_data_profile()
+        self.data_profile = (
+            self._load_or_compute_data_profile()
+        )
 
         self.print_data_profile()
+
+
+    # ========================================================
+    # Lazy model initialization
+    # ========================================================
+
+    def _ensure_model_initialized(self) -> None:
+        """
+        Create the local VGG16 model only when it is actually
+        required for parameter exchange, local training, or
+        evaluation.
+
+        Pre-selection profiling does not require the model.
+        """
+
+        if self.model is not None:
+            return
+
+        print(
+            f"[CLIENT {self.cid}] "
+            f"Initializing VGG16 model..."
+        )
+
+        self.model = build_vgg16(
+            num_classes=10
+        ).to(DEVICE)
+
+        self.criterion = nn.CrossEntropyLoss()
+
+        self.opt = optim.SGD(
+            self.model.parameters(),
+            lr=self.cfg.lr,
+            momentum=0.9,
+            weight_decay=5e-4,
+        )
+
+        self.model_bytes = model_size_bytes(
+            self.model
+        )
+
+        print(
+            f"[CLIENT {self.cid}] "
+            f"VGG16 model initialized."
+        )
+
+    def _release_model(self) -> None:
+        """
+        Release model-related resources after a client operation.
+
+        This is important in Flower/Ray simulation because one
+        Ray worker can execute multiple logical clients
+        sequentially. Keeping model objects alive can cause host
+        RAM and GPU memory pressure across client operations.
+        """
+
+        self.opt = None
+        self.criterion = None
+        self.model = None
+        self.model_bytes = None
+
+        import gc
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print(
+            f"[CLIENT {self.cid}] "
+            f"Released VGG16 model resources."
+            )
+
+    # ========================================================
+    # Static data-profile cache
+    # ========================================================
+
+    def _data_profile_cache_path(self) -> str:
+        """
+        Return a cache path uniquely associated with the
+        client's data partition configuration.
+
+        The cache key includes all settings that determine
+        which samples belong to the logical client.
+        """
+
+        os.makedirs(
+            self.cfg.data_profile_cache_dir,
+            exist_ok=True,
+        )
+
+        if self.cfg.partition_mode == "dirichlet":
+            partition_tag = (
+                f"dirichlet_alpha_{self.cfg.dirichlet_alpha}"
+            )
+        else:
+            partition_tag = "iid"
+
+        filename = (
+            f"cinic10_"
+            f"clients_{self.cfg.num_clients}_"
+            f"{partition_tag}_"
+            f"seed_{self.cfg.base_seed}_"
+            f"cid_{self.cid}.json"
+        )
+
+        return os.path.join(
+            self.cfg.data_profile_cache_dir,
+            filename,
+        )
+
+
+    def _load_or_compute_data_profile(
+        self,
+    ) -> Dict[str, object]:
+        """
+        Load the static local data profile from disk when it
+        already exists.
+
+        Otherwise compute it once and save it for reuse.
+
+        This avoids repeating expensive image-based profiling
+        when Ray recreates the same logical client.
+        """
+
+        cache_path = (
+            self._data_profile_cache_path()
+        )
+
+        # ----------------------------------------------------
+        # Reuse previously computed profile
+        # ----------------------------------------------------
+
+        if os.path.exists(cache_path):
+
+            try:
+
+                with open(
+                    cache_path,
+                    "r",
+                    encoding="utf-8",
+                ) as file:
+
+                    profile = json.load(file)
+
+                print(
+                    f"[CLIENT {self.cid}] "
+                    f"Loaded data profile from cache."
+                )
+
+                return profile
+
+            except (
+                OSError,
+                json.JSONDecodeError,
+            ) as exc:
+
+                print(
+                    f"[CLIENT {self.cid}] "
+                    f"Could not read cached data profile: "
+                    f"{exc}"
+                )
+
+                print(
+                    f"[CLIENT {self.cid}] "
+                    f"Recomputing data profile."
+                )
+
+        # ----------------------------------------------------
+        # First use: compute profile normally
+        # ----------------------------------------------------
+
+        profile = self.compute_data_profile()
+
+        # ----------------------------------------------------
+        # Save the result
+        # ----------------------------------------------------
+
+        temporary_path = (
+            cache_path
+            + f".tmp.{os.getpid()}"
+        )
+
+        try:
+
+            with open(
+                temporary_path,
+                "w",
+                encoding="utf-8",
+            ) as file:
+
+                json.dump(
+                    profile,
+                    file,
+                    indent=2,
+                )
+
+            os.replace(
+                temporary_path,
+                cache_path,
+            )
+
+            print(
+                f"[CLIENT {self.cid}] "
+                f"Saved data profile to cache."
+            )
+
+        finally:
+
+            if os.path.exists(
+                temporary_path
+            ):
+                try:
+                    os.remove(
+                        temporary_path
+                    )
+                except OSError:
+                    pass
+
+        return profile
 
 
     # ========================================================
@@ -1570,7 +1795,17 @@ class ProposedClient(fl.client.NumPyClient):
     # ========================================================
 
     def get_parameters(self, config):
-        return get_params(self.model)
+
+        self._ensure_model_initialized()
+
+        parameters = get_params(
+            self.model
+        )
+
+        self._release_model()
+
+        return parameters
+        
 
 
     # ========================================================
@@ -1582,6 +1817,8 @@ class ProposedClient(fl.client.NumPyClient):
         parameters,
         config,
     ):
+
+        self._ensure_model_initialized()
 
         set_params(
             self.model,
@@ -1695,11 +1932,21 @@ class ProposedClient(fl.client.NumPyClient):
             f"samples/s={samples_per_second:.2f}"
         )
 
+        updated_parameters = get_params(
+            self.model
+        )
+
+        num_examples = len(
+           self.train_loader.dataset
+        )
+
+        self._release_model()
+
         return (
-            get_params(self.model),
+            updated_parameters,
             num_examples,
             metrics,
-        )
+          )
 
 
     # ========================================================
@@ -1711,6 +1958,8 @@ class ProposedClient(fl.client.NumPyClient):
         parameters,
         config,
     ):
+
+        self._ensure_model_initialized()
 
         set_params(
             self.model,
@@ -1767,19 +2016,22 @@ class ProposedClient(fl.client.NumPyClient):
             / max(1, total)
         )
 
+        num_examples = len(
+            self.test_loader.dataset
+        )
+
+        metrics = {
+            "accuracy": float(acc),
+            "eval_loss": float(avg_loss),
+            "eval_duration": float(eval_duration),
+        }
+
+        self._release_model()
+
         return (
-            float(avg_loss),
-            int(total),
-            {
-                "accuracy":
-                    float(acc),
-
-                "eval_loss":
-                    float(avg_loss),
-
-                "eval_duration":
-                    float(eval_duration),
-            },
+            avg_loss,
+            num_examples,
+            metrics,
         )
 
 

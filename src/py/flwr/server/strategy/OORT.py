@@ -458,6 +458,7 @@ class OORT(FedAvg):
 
         config["strategy"] = "Oort"
         config["server_round"] = server_round
+        config["enable_oort_utility"] = True
 
         fit_ins = FitIns(parameters, config)
 
@@ -476,19 +477,8 @@ class OORT(FedAvg):
 
         return selected
 
-    def aggregate_fit(
-        self,
-        server_round: int,
-        results: List[Tuple[ClientProxy, FitRes]],
-        failures,
-    ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
-
-        aggregated_parameters, aggregated_metrics = super().aggregate_fit(
-            server_round,
-            results,
-            failures,
-        )
-
+    def update_history_from_results(self, server_round, results):
+        """Update Oort history without aggregating model parameters."""
         round_stat_utility = 0.0
 
         for client, fit_res in results:
@@ -532,4 +522,10 @@ class OORT(FedAvg):
         self.round_stat_utility_history.append(round_stat_utility)
         self._refresh_blacklist()
 
+
+    def aggregate_fit(self, server_round, results, failures):
+        aggregated_parameters, aggregated_metrics = super().aggregate_fit(
+            server_round, results, failures,
+        )
+        self.update_history_from_results(server_round, results)
         return aggregated_parameters, aggregated_metrics
